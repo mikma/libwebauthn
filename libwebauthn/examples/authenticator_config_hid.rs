@@ -3,13 +3,15 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use libwebauthn::management::AuthenticatorConfig;
-use libwebauthn::pin::{UvProvider, StdinPromptPinProvider};
+use libwebauthn::pin::PinRequestReason;
 use libwebauthn::proto::ctap2::{Ctap2, Ctap2GetInfoResponse};
 use libwebauthn::transport::hid::list_devices;
 use libwebauthn::transport::Device;
 use libwebauthn::webauthn::Error as WebAuthnError;
+use libwebauthn::UxUpdate;
 use std::io::{self, Write};
 use text_io::read;
+use tokio::sync::mpsc::Receiver;
 use tracing_subscriber::{self, EnvFilter};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,6 +21,46 @@ fn setup_logging() {
         .with_env_filter(EnvFilter::from_default_env())
         .without_time()
         .init();
+}
+
+async fn handle_updates(mut state_recv: Receiver<UxUpdate>) {
+    while let Some(update) = state_recv.recv().await {
+        match update {
+            UxUpdate::PresenceRequired => println!("Please touch your device!"),
+            UxUpdate::UvRetry { attempts_left } => {
+                print!("UV failed.");
+                if let Some(attempts_left) = attempts_left {
+                    print!(" You have {attempts_left} attempts left.");
+                }
+            }
+            UxUpdate::PinRequired(update) => {
+                let mut attempts_str = String::new();
+                if let Some(attempts) = update.attempts_left {
+                    attempts_str = format!(". You have {attempts} attempts left!");
+                };
+
+                match update.reason {
+                    PinRequestReason::RelyingPartyRequest => println!("RP required a PIN."),
+                    PinRequestReason::AuthenticatorPolicy => {
+                        println!("Your device requires a PIN.")
+                    }
+                    PinRequestReason::FallbackFromUV => {
+                        println!("UV failed too often and is blocked. Falling back to PIN.")
+                    }
+                }
+                print!("PIN: Please enter the PIN for your authenticator{attempts_str}: ");
+                io::stdout().flush().unwrap();
+                let pin_raw: String = read!("{}\n");
+
+                if pin_raw.is_empty() {
+                    println!("PIN: No PIN provided, cancelling operation.");
+                    update.cancel();
+                } else {
+                    let _ = update.send_pin(&pin_raw);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,13 +120,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
     let devices = list_devices().await.unwrap();
     println!("Devices found: {:?}", devices);
-    let pin_provider: Box<dyn UvProvider> = Box::new(StdinPromptPinProvider::new());
 
     for mut device in devices {
         println!("Selected HID authenticator: {}", &device);
-        device.wink(TIMEOUT).await?;
+        let (mut channel, state_recv) = device.channel().await?;
+        channel.wink(TIMEOUT).await?;
 
-        let mut channel = device.channel().await?;
+        tokio::spawn(handle_updates(state_recv));
+
         let info = channel.ctap2_get_info().await?;
         let options = get_supported_options(&info);
 
@@ -139,24 +182,18 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
         loop {
             let action = match options[idx] {
-                Operation::ToggleAlwaysUv => channel.toggle_always_uv(&pin_provider, TIMEOUT),
-                Operation::SetMinPinLengthRpids => channel.set_min_pin_length_rpids(
-                    min_pin_length_rpids.clone(),
-                    &pin_provider,
-                    TIMEOUT,
-                ),
+                Operation::ToggleAlwaysUv => channel.toggle_always_uv(TIMEOUT),
+                Operation::SetMinPinLengthRpids => {
+                    channel.set_min_pin_length_rpids(min_pin_length_rpids.clone(), TIMEOUT)
+                }
                 Operation::SetMinPinLength(..) => {
-                    channel.set_min_pin_length(new_pin_length, &pin_provider, TIMEOUT)
+                    channel.set_min_pin_length(new_pin_length, TIMEOUT)
                 }
                 Operation::EnableEnterpriseAttestation => {
-                    channel.enable_enterprise_attestation(&pin_provider, TIMEOUT)
+                    channel.enable_enterprise_attestation(TIMEOUT)
                 }
-                Operation::EnableForceChangePin => {
-                    channel.force_change_pin(true, &pin_provider, TIMEOUT)
-                }
-                Operation::DisableForceChangePin => {
-                    channel.force_change_pin(false, &pin_provider, TIMEOUT)
-                }
+                Operation::EnableForceChangePin => channel.force_change_pin(true, TIMEOUT),
+                Operation::DisableForceChangePin => channel.force_change_pin(false, TIMEOUT),
             };
             match action.await {
                 Ok(_) => break Ok(()),
