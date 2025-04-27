@@ -122,7 +122,9 @@ where
         &mut self,
         op: &MakeCredentialRequest,
     ) -> Result<MakeCredentialResponse, Error> {
-        let mut ctap2_request: Ctap2MakeCredentialRequest = op.into();
+        let get_info_response = self.ctap2_get_info().await?;
+        let mut ctap2_request =
+            Ctap2MakeCredentialRequest::from_webauthn_request(op, &get_info_response)?;
         if let Some(exclude_list) = &op.exclude {
             let filtered_exclude_list =
                 ctap2_preflight(self, exclude_list, &op.hash, &op.relying_party.id).await;
@@ -145,7 +147,7 @@ where
                 op.timeout
             )
         }?;
-        let make_cred = response.into_make_credential_output(op, self.get_auth_data());
+        let make_cred = response.into_make_credential_output(op, Some(&get_info_response));
         Ok(make_cred)
     }
 
@@ -178,7 +180,9 @@ where
         &mut self,
         op: &GetAssertionRequest,
     ) -> Result<GetAssertionResponse, Error> {
-        let mut ctap2_request: Ctap2GetAssertionRequest = op.into();
+        let get_info_response = self.ctap2_get_info().await?;
+        let mut ctap2_request =
+            Ctap2GetAssertionRequest::from_webauthn_request(op, &get_info_response)?;
         let filtered_allow_list =
             ctap2_preflight(self, &op.allow, &op.hash, &op.relying_party_id).await;
         if filtered_allow_list.is_empty() && !op.allow.is_empty() {

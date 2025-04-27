@@ -3,7 +3,6 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use ctap_types::ctap2::credential_management::CredentialProtectionPolicy;
 use libwebauthn::UxUpdate;
 use rand::{thread_rng, Rng};
 use text_io::read;
@@ -11,8 +10,9 @@ use tokio::sync::mpsc::Receiver;
 use tracing_subscriber::{self, EnvFilter};
 
 use libwebauthn::ops::webauthn::{
-    GetAssertionHmacOrPrfInput, GetAssertionRequest, GetAssertionRequestExtensions,
-    HMACGetSecretInput, MakeCredentialHmacOrPrfInput, MakeCredentialRequest,
+    CredentialProtectionExtension, CredentialProtectionPolicy, GetAssertionHmacOrPrfInput,
+    GetAssertionRequest, GetAssertionRequestExtensions, HMACGetSecretInput,
+    MakeCredentialHmacOrPrfInput, MakeCredentialLargeBlobExtension, MakeCredentialRequest,
     MakeCredentialsRequestExtensions, UserVerificationRequirement,
 };
 use libwebauthn::pin::PinRequestReason;
@@ -84,11 +84,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     let challenge: [u8; 32] = thread_rng().gen();
 
     let extensions = MakeCredentialsRequestExtensions {
-        cred_protect: Some(CredentialProtectionPolicy::Required),
+        cred_protect: Some(CredentialProtectionExtension {
+            policy: CredentialProtectionPolicy::UserVerificationRequired,
+            enforce_policy: true,
+        }),
         cred_blob: Some(r"My own little blob".into()),
-        large_blob_key: None,
+        large_blob: MakeCredentialLargeBlobExtension::None,
         min_pin_length: Some(true),
         hmac_or_prf: MakeCredentialHmacOrPrfInput::HmacGetSecret,
+        cred_props: Some(true),
     };
 
     for mut device in devices {
@@ -148,6 +152,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     salt1: [1; 32],
                     salt2: None,
                 }),
+                ..Default::default()
             }),
             timeout: TIMEOUT,
         };

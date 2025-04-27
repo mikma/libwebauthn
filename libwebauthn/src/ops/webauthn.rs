@@ -3,8 +3,8 @@ use std::{
     time::Duration,
 };
 
-use ctap_types::ctap2::credential_management::CredentialProtectionPolicy;
-use serde::Deserialize;
+use ctap_types::ctap2::credential_management::CredentialProtectionPolicy as Ctap2CredentialProtectionPolicy;
+use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, instrument, trace};
@@ -113,11 +113,67 @@ pub enum MakeCredentialHmacOrPrfOutput {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct CredentialProtectionExtension {
+    pub policy: CredentialProtectionPolicy,
+    pub enforce_policy: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialProtectionPolicy {
+    UserVerificationOptional = 1,
+    UserVerificationOptionalWithCredentialIdList = 2,
+    UserVerificationRequired = 3,
+}
+
+impl From<CredentialProtectionPolicy> for Ctap2CredentialProtectionPolicy {
+    fn from(value: CredentialProtectionPolicy) -> Self {
+        match value {
+            CredentialProtectionPolicy::UserVerificationOptional => {
+                Ctap2CredentialProtectionPolicy::Optional
+            }
+            CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList => {
+                Ctap2CredentialProtectionPolicy::OptionalWithCredentialIdList
+            }
+            CredentialProtectionPolicy::UserVerificationRequired => {
+                Ctap2CredentialProtectionPolicy::Required
+            }
+        }
+    }
+}
+
+impl From<Ctap2CredentialProtectionPolicy> for CredentialProtectionPolicy {
+    fn from(value: Ctap2CredentialProtectionPolicy) -> Self {
+        match value {
+            Ctap2CredentialProtectionPolicy::Optional => {
+                CredentialProtectionPolicy::UserVerificationOptional
+            }
+            Ctap2CredentialProtectionPolicy::OptionalWithCredentialIdList => {
+                CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList
+            }
+            Ctap2CredentialProtectionPolicy::Required => {
+                CredentialProtectionPolicy::UserVerificationRequired
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MakeCredentialLargeBlobExtension {
+    #[default]
+    None,
+    Preferred,
+    Required,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MakeCredentialsRequestExtensions {
-    pub cred_protect: Option<CredentialProtectionPolicy>,
+    pub cred_props: Option<bool>,
+    pub cred_protect: Option<CredentialProtectionExtension>,
     pub cred_blob: Option<Vec<u8>>,
-    pub large_blob_key: Option<bool>,
+    pub large_blob: MakeCredentialLargeBlobExtension,
     pub min_pin_length: Option<bool>,
     pub hmac_or_prf: MakeCredentialHmacOrPrfInput,
 }
@@ -130,6 +186,9 @@ pub struct MakeCredentialsResponseExtensions {
     /// Current min PIN lenght
     pub min_pin_length: Option<u32>,
     pub hmac_or_prf: MakeCredentialHmacOrPrfOutput,
+    // Currently, credProps only returns one value: rk = bool
+    // If these get more in the future, we can use a struct here.
+    pub cred_props_rk: Option<bool>,
 }
 
 impl MakeCredentialRequest {
@@ -190,10 +249,20 @@ pub struct HMACGetSecretInput {
     pub salt2: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum GetAssertionLargeBlobExtension {
+    #[default]
+    None,
+    Read,
+    // Not yet supported
+    // Write(Vec<u8>),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct GetAssertionRequestExtensions {
     pub cred_blob: Option<bool>,
     pub hmac_or_prf: GetAssertionHmacOrPrfInput,
+    pub large_blob: GetAssertionLargeBlobExtension,
 }
 
 #[derive(Clone, Debug, Default)]

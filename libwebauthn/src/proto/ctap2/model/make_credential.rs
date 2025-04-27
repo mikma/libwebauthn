@@ -7,14 +7,15 @@ use super::{
 use crate::{
     fido::AuthenticatorData,
     ops::webauthn::{
-        MakeCredentialHmacOrPrfInput, MakeCredentialHmacOrPrfOutput, MakeCredentialRequest,
-        MakeCredentialResponse, MakeCredentialsRequestExtensions,
-        MakeCredentialsResponseExtensions,
+        CredentialProtectionPolicy, MakeCredentialHmacOrPrfInput, MakeCredentialHmacOrPrfOutput,
+        MakeCredentialLargeBlobExtension, MakeCredentialRequest, MakeCredentialResponse,
+        MakeCredentialsRequestExtensions, MakeCredentialsResponseExtensions,
     },
     pin::PinUvAuthProtocol,
-    transport::AuthTokenData,
+    proto::CtapError,
+    webauthn::Error,
 };
-use ctap_types::ctap2::credential_management::CredentialProtectionPolicy;
+use ctap_types::ctap2::credential_management::CredentialProtectionPolicy as Ctap2CredentialProtectionPolicy;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_cbor::Value;
@@ -110,17 +111,66 @@ impl Ctap2MakeCredentialRequest {
             .as_ref()
             .map_or(true, |extensions| extensions.skip_serializing())
     }
+
+    pub(crate) fn from_webauthn_request(
+        req: &MakeCredentialRequest,
+        info: &Ctap2GetInfoResponse,
+    ) -> Result<Self, Error> {
+        // Cloning it, so we can modify it
+        let mut req = req.clone();
+        // Checking if extensions can be fulfilled
+        //
+        // CredProtection
+        // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#credProtectFeatureDetection
+        // When enforceCredentialProtectionPolicy is true, and credentialProtectionPolicy's value
+        // is either userVerificationOptionalWithCredentialIDList or userVerificationRequired,
+        // the platform SHOULD NOT create the credential in a way that does not implement the
+        // requested protection policy. (For example, by creating it on an authenticator that
+        // does not support this extension.)
+        if let Some(cred_protection) = req
+            .extensions
+            .as_ref()
+            .and_then(|x| x.cred_protect.as_ref())
+        {
+            if cred_protection.enforce_policy
+                && cred_protection.policy != CredentialProtectionPolicy::UserVerificationOptional
+                && !info.is_uv_protected()
+            {
+                return Err(Error::Ctap(CtapError::UnsupportedExtension));
+            }
+        }
+
+        // LargeBlob (NOTE: Not to be confused with LargeBlobKey. LargeBlob has "Preferred" as well)
+        // https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API/WebAuthn_extensions#largeblob
+        //
+        // "required": The credential will be created with an authenticator to store blobs. The create() call will fail if this is impossible.
+        if let Some(ext) = req.extensions.as_mut() {
+            if ext.large_blob == MakeCredentialLargeBlobExtension::Required
+                && !info.option_enabled("largeBlobs")
+            {
+                return Err(Error::Ctap(CtapError::UnsupportedExtension));
+            }
+            if !info.option_enabled("largeBlobs")
+                && ext.large_blob == MakeCredentialLargeBlobExtension::Preferred
+            {
+                // If it is preferred and the device does not support it, deactivate it.
+                // Then we can simply activate it later for all but None
+                ext.large_blob = MakeCredentialLargeBlobExtension::None;
+            }
+        }
+        Ok(Ctap2MakeCredentialRequest::from(req))
+    }
 }
 
-impl From<&MakeCredentialRequest> for Ctap2MakeCredentialRequest {
-    fn from(op: &MakeCredentialRequest) -> Ctap2MakeCredentialRequest {
+impl From<MakeCredentialRequest> for Ctap2MakeCredentialRequest {
+    fn from(op: MakeCredentialRequest) -> Ctap2MakeCredentialRequest {
         Ctap2MakeCredentialRequest {
-            hash: ByteBuf::from(op.hash.clone()),
-            relying_party: op.relying_party.clone(),
-            user: op.user.clone(),
-            algorithms: op.algorithms.clone(),
-            exclude: op.exclude.clone(),
-            extensions: op.extensions.as_ref().map(|x| x.clone().into()),
+            hash: ByteBuf::from(op.hash),
+            relying_party: op.relying_party,
+            user: op.user,
+            algorithms: op.algorithms,
+            exclude: op.exclude,
+            extensions: op.extensions.map(|x| x.into()),
             options: Some(Ctap2MakeCredentialOptions {
                 require_resident_key: if op.require_resident_key {
                     Some(true)
@@ -140,7 +190,7 @@ impl From<&MakeCredentialRequest> for Ctap2MakeCredentialRequest {
 #[serde(rename_all = "camelCase")]
 pub struct Ctap2MakeCredentialsRequestExtensions {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cred_protect: Option<CredentialProtectionPolicy>,
+    pub cred_protect: Option<Ctap2CredentialProtectionPolicy>,
     #[serde(skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub cred_blob: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,8 +223,14 @@ impl From<MakeCredentialsRequestExtensions> for Ctap2MakeCredentialsRequestExten
         Ctap2MakeCredentialsRequestExtensions {
             cred_blob: other.cred_blob,
             hmac_secret,
-            cred_protect: other.cred_protect,
-            large_blob_key: other.large_blob_key,
+            cred_protect: other.cred_protect.map(|x| x.policy.into()),
+            large_blob_key: if other.large_blob == MakeCredentialLargeBlobExtension::None {
+                None
+            } else {
+                // We modified "Preferred" to "None" if the device does not support it,
+                // so we can be sure to request it here for all but "None"
+                Some(true)
+            },
             min_pin_length: other.min_pin_length,
         }
     }
@@ -201,7 +257,7 @@ impl Ctap2MakeCredentialResponse {
     pub fn into_make_credential_output(
         self,
         request: &MakeCredentialRequest,
-        auth_data: Option<&AuthTokenData>,
+        info: Option<&Ctap2GetInfoResponse>,
     ) -> MakeCredentialResponse {
         let authenticator_data = AuthenticatorData::<MakeCredentialsResponseExtensions> {
             rp_id_hash: self.authenticator_data.rp_id_hash,
@@ -211,7 +267,7 @@ impl Ctap2MakeCredentialResponse {
             extensions: self
                 .authenticator_data
                 .extensions
-                .map(|x| x.into_output(request, auth_data)),
+                .map(|x| x.into_output(request, info)),
         };
         MakeCredentialResponse {
             format: self.format,
@@ -268,7 +324,7 @@ impl Ctap2UserVerifiableRequest for Ctap2MakeCredentialRequest {
 #[serde(rename_all = "camelCase")]
 pub struct Ctap2MakeCredentialsResponseExtensions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cred_protect: Option<CredentialProtectionPolicy>,
+    pub cred_protect: Option<Ctap2CredentialProtectionPolicy>,
     // If storing credBlob was successful
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cred_blob: Option<bool>,
@@ -292,7 +348,7 @@ impl Ctap2MakeCredentialsResponseExtensions {
     pub fn into_output(
         self,
         request: &MakeCredentialRequest,
-        _auth_data: Option<&AuthTokenData>,
+        info: Option<&Ctap2GetInfoResponse>,
     ) -> MakeCredentialsResponseExtensions {
         let hmac_or_prf = if let Some(incoming_ext) = &request.extensions {
             match &incoming_ext.hmac_or_prf {
@@ -309,11 +365,39 @@ impl Ctap2MakeCredentialsResponseExtensions {
         } else {
             MakeCredentialHmacOrPrfOutput::None
         };
+
+        // credProps extension
+        // https://w3c.github.io/webauthn/#sctn-authenticator-credential-properties-extension
+        let cred_props_rk = match &request
+            .extensions
+            .as_ref()
+            .and_then(|x| x.cred_props.as_ref())
+        {
+            None | Some(false) => None, // Not requested, so we don't give an answer
+            Some(true) => {
+                // https://w3c.github.io/webauthn/#dom-credentialpropertiesoutput-rk
+                // Some authenticators create discoverable credentials even when not
+                // requested by the client platform. Because of this, client platforms may be
+                // forced to omit the rk property because they lack the assurance to be able
+                // to set it to false.
+                if info.map(|x| x.supports_fido_2_1()) == Some(true) {
+                    // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#op-makecred-step-rk
+                    // if the "rk" option is false: the authenticator MUST create a non-discoverable credential.
+                    // Note: This step is a change from CTAP2.0 where if the "rk" option is false the authenticator could optionally create a discoverable credential.
+                    Some(request.require_resident_key)
+                } else {
+                    // For CTAP 2.0, we can't say if "rk" is true or not.
+                    None
+                }
+            }
+        };
+
         MakeCredentialsResponseExtensions {
-            cred_protect: self.cred_protect,
+            cred_protect: self.cred_protect.map(|x| x.into()),
             cred_blob: self.cred_blob,
             min_pin_length: self.min_pin_length,
             hmac_or_prf,
+            cred_props_rk,
         }
     }
 }
