@@ -121,3 +121,22 @@ pub async fn list_devices() -> Result<Vec<NfcDevice>, Error> {
 
     Ok(all_devices)
 }
+
+#[instrument]
+pub async fn stream_devices() -> Result<Vec<NfcDevice>, Error> {
+    let mut all_devices = Vec::new();
+    let list_devices_fns = [
+        #[cfg(feature = "pcsc")]
+        pcsc::list_devices,
+    ];
+
+    for list_devices in list_devices_fns {
+        let mut devices = list_devices()?
+            .into_iter()
+            .filter(|e| is_fido::<Context>(&e))
+            .collect::<Vec<NfcDevice>>();
+        all_devices.append(&mut devices);
+    }
+
+    Ok(all_devices)
+}

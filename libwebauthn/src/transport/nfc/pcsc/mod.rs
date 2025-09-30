@@ -10,6 +10,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[allow(unused_imports)]
 use tracing::{debug, info, instrument, trace};
 
@@ -103,7 +104,36 @@ impl Info {
 
 impl Channel {
     pub fn new(info: &Info, context: pcsc::Context) -> Result<Self, Error> {
-        let card = context.connect(&info.name, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)?;
+        let wait_on_reader = |e| {
+            match e {
+                _ => {
+                    debug!("get_status_change {:?}", info.name);
+                    let timeout = Duration::from_secs(5);
+                    let mut reader_states = vec![
+                        // Listen for reader insertions/removals, if supported.
+                        pcsc::ReaderState::new(info.name.clone(), pcsc::State::UNAWARE),
+                    ];
+
+                    loop {
+                        // Update the view of the state to wait on.
+                        for rs in &mut reader_states {
+                            rs.sync_current_state();
+                        }
+
+                        context.get_status_change(timeout, &mut reader_states)?;
+                        println!("status change {:?} {:?} {}", reader_states[0].name(), reader_states[0].event_state(), reader_states[0].event_count());
+
+                        if reader_states[0].event_state().contains(pcsc::State::CHANGED | pcsc::State::PRESENT) {
+                            break
+                        }
+                    }
+                    context.connect(&info.name, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+                }
+            }
+        };
+
+        let card = context.connect(&info.name, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+            .or_else(wait_on_reader)?;
 
         let chan = Self {
             card: Arc::new(Mutex::new(PcscCard::new(card))),
@@ -158,6 +188,24 @@ pub fn list_devices() -> Result<Vec<NfcDevice>, Error> {
     let devices = ctx
         .list_readers(&mut readers_buf)
         .expect("PC/SC readers")
+        .filter(|x| x.to_bytes() == b"ACS ACR122U 00 00")
+//        .filter(|x| x.to_bytes() == b"Prolific Technology, Inc. PL2303 Serial Port / Mobile Phone Data Cable 00 00")
+        .map(|x| NfcDevice::new_pcsc(Info::new(x)))
+        .collect::<Vec<NfcDevice>>();
+
+    Ok(devices)
+}
+
+#[instrument]
+pub fn discover_devices() -> Result<Vec<NfcDevice>, Error> {
+    let ctx = pcsc::Context::establish(pcsc::Scope::User).expect("PC/SC context");
+    let len = ctx.list_readers_len().expect("PC/SC readers len");
+    let mut readers_buf = vec![0; len];
+    let devices = ctx
+        .list_readers(&mut readers_buf)
+        .expect("PC/SC readers")
+        .filter(|x| x.to_bytes() == b"ACS ACR122U 00 00")
+//        .filter(|x| x.to_bytes() == b"Prolific Technology, Inc. PL2303 Serial Port / Mobile Phone Data Cable 00 00")
         .map(|x| NfcDevice::new_pcsc(Info::new(x)))
         .collect::<Vec<NfcDevice>>();
 
